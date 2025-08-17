@@ -21,12 +21,22 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: python -m pip install --upgrade pip && pip install requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pillow pytesseract
+
+      - name: Install tesseract (for OCR fallback)
+        run: |
+          # optional, required only if you plan to run OCR on PNGs
+          sudo apt-get update -y
+          sudo apt-get install -y tesseract-ocr
 
       - name: Run recon probe
         env:
-          ATTACKER_ORIGIN: ${{ secrets.ATTACKER_ORIGIN }}  # optional override
-          TEST_COOKIE: ${{ secrets.TEST_COOKIE }}          # optional
+          ATTACKER_ORIGIN: ${{ secrets.ATTACKER_ORIGIN }}
+          TEST_COOKIE: ${{ secrets.TEST_COOKIE }}
+          AUTH_BEARER: ${{ secrets.AUTH_BEARER }}
+          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
           python scripts/recon_probe.py
 
@@ -38,7 +48,7 @@ jobs:
         run: |
           python scripts/generate_pocs.py
 
-      - name: Prepare archive
+      - name: Save artifacts (zip)
         run: |
           ls -lah out || true
           ls -lah pocs || true
