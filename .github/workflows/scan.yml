@@ -1,147 +1,96 @@
 name: scan
+
 on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type exactly True to confirm you have written authorization to scan these targets'
+        description: "Type True (case-sensitive) to confirm you have written authorization to scan targets in hosts.txt"
         required: true
-        default: 'False'
+        default: "False"
 
 permissions:
   contents: read
 
 jobs:
   scan:
+    if: ${{ github.event.inputs.confirm == 'True' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 420
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Validate manual confirmation
-        run: |
-          echo "confirm input: '${{ github.event.inputs.confirm }}'"
-          if [ "${{ github.event.inputs.confirm }}" != "True" ]; then
-            echo "ERROR: You must type the exact string 'True' (case-sensitive) to proceed."
-            exit 1
-          fi
+        run: echo "Confirmed = ${{ github.event.inputs.confirm }}"
 
-      - name: Show repo (debug)
+      - name: Show repo root and contents (debug)
         run: |
-          echo "PWD: $(pwd)"
-          echo "TOP-LEVEL:"
+          pwd
           ls -la
-          echo "RECURSIVE (depth 3):"
-          find . -maxdepth 3 -type f -print | sed -n '1,200p'
+          echo "---- scripts/ ----"
+          ls -la scripts || true
 
-      - name: Discover scan.sh (root -> scripts -> find)
-        id: discover
+      - name: Validate presence of essential files
         run: |
-          SCRIPT=""
-          if [ -f "./scan.sh" ]; then
-            SCRIPT="./scan.sh"
-          elif [ -f "./scripts/scan.sh" ]; then
-            SCRIPT="./scripts/scan.sh"
-          else
-            SCRIPT=$(find . -maxdepth 4 -type f -name "scan.sh" -print -quit || true)
-          fi
-          if [ -z "$SCRIPT" ]; then
-            echo "ERROR: scan.sh not found (searched root, ./scripts/, depth 4)."
-            exit 1
-          fi
-          echo "Found scan script at: $SCRIPT"
-          echo "script_path=$SCRIPT" >> "$GITHUB_OUTPUT"
-          echo "script_dir=$(dirname "$SCRIPT")" >> "$GITHUB_OUTPUT"
-
-      - name: Validate required companion files
-        run: |
-          SCRIPT_DIR="${{ steps.discover.outputs.script_dir }}"
-          # hosts.txt must exist at repo root (we will copy if running from subdir)
-          if [ ! -f "$GITHUB_WORKSPACE/hosts.txt" ]; then
-            echo "ERROR: hosts.txt not found in repo root ($GITHUB_WORKSPACE/hosts.txt)."
-            exit 1
-          fi
-
-          # Check smart_hunt.py & vendor_fingerprints.py either next to scan.sh or in repo root
           missing=0
-          for f in smart_hunt.py vendor_fingerprints.py; do
-            if [ -f "$SCRIPT_DIR/$f" ]; then
-              echo "OK: $f found in $SCRIPT_DIR"
-            elif [ -f "$GITHUB_WORKSPACE/$f" ]; then
-              echo "OK: $f found in repo root"
-            else
-              echo "ERROR: Required $f not found in $SCRIPT_DIR or repo root"
+          for f in scripts/scan.sh scripts/smart_hunt.py scripts/vendor_fingerprints.py hosts.txt; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: Required file '$f' not found."
               missing=1
             fi
           done
-          if [ "$missing" -eq 1 ]; then
-            echo "Aborting due to missing companion files."
+          if [ $missing -ne 0 ]; then
+            echo "Aborting due to missing files."
             exit 1
           fi
 
-      - name: Make discovered script executable
-        run: |
-          SCRIPT_PATH="${{ steps.discover.outputs.script_path }}"
-          echo "chmod +x $SCRIPT_PATH"
-          chmod +x "$SCRIPT_PATH"
-          ls -la "$(dirname "$SCRIPT_PATH")"
+      - name: Make scan.sh executable
+        run: chmod +x scripts/scan.sh
 
-      - name: Install system deps
+      - name: Install system dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq dnsutils unzip git build-essential
           python3 -m pip install --upgrade pip
           pip3 install aiohttp tldextract
-        shell: bash
 
-      - name: Setup Go (optional)
+      - name: Setup Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.22'
+          go-version: "1.22"
 
-      - name: Install optional Go tools (best-effort)
+      - name: Cache Go and nuclei templates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            ~/.local/nuclei-templates
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-nuclei
+
+      - name: Install optional Go tools (subfinder, amass, httpx, nuclei)
         run: |
           echo "$HOME/go/bin" >> $GITHUB_PATH
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest || true
-          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
-          go install github.com/owasp-amass/amass/v4/...@latest || true
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
+          go install -v github.com/owasp-amass/amass/v4/...@latest || true
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest || true
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
           if command -v nuclei >/dev/null 2>&1; then
             nuclei -update-templates -silent || true
           fi
-        shell: bash
 
-      - name: Prepare execution dir (copy hosts.txt if script is in subdir)
-        run: |
-          SCRIPT_DIR="${{ steps.discover.outputs.script_dir }}"
-          # If script dir is not repo root, copy hosts.txt into it so relative references work
-          if [ "$SCRIPT_DIR" != "." ] && [ "$SCRIPT_DIR" != "/" ]; then
-            echo "Copying hosts.txt to $SCRIPT_DIR/hosts.txt"
-            cp "$GITHUB_WORKSPACE/hosts.txt" "$GITHUB_WORKSPACE/$SCRIPT_DIR/hosts.txt"
-          fi
-          echo "Working dir for scan: $SCRIPT_DIR"
-        shell: bash
-
-      - name: Run the scan from script directory
+      - name: Run the scan (uses discovered script)
         env:
-          SCAN_CONFIRM: "True"
-          GLOBAL_CONCURRENCY: "6"
-          PER_TARGET_CONCURRENCY: "6"
-          HTTPX_THREADS: "40"
-          NUCLEI_RATE_LIMIT: "80"
-          NUCLEI_THREADS: "40"
-        run: |
-          SCRIPT_PATH="${{ steps.discover.outputs.script_path }}"
-          SCRIPT_DIR="${{ steps.discover.outputs.script_dir }}"
-          echo "About to run: $SCRIPT_PATH (working dir: $SCRIPT_DIR)"
-          # Ensure absolute path and strip leading './' for pushd
-          cd "$GITHUB_WORKSPACE/$SCRIPT_DIR"
-          echo "PWD now: $(pwd)"
-          echo "---- head of script (first 80 lines) ----"
-          sed -n '1,80p' "$(basename "$SCRIPT_PATH")" || true
-          echo "---- executing script ----"
-          bash -x "$(basename "$SCRIPT_PATH")"
-        shell: bash
+          SCAN_CONFIRM: ${{ github.event.inputs.confirm }}
+          GLOBAL_CONCURRENCY: "8"          # parallel roots
+          PER_TARGET_CONCURRENCY: "8"      # async checks per root
+          HTTPX_THREADS: "200"
+          HTTPX_TIMEOUT: "10"
+          NUCLEI_THREADS: "120"
+          NUCLEI_RATE_LIMIT: "140"
+          AMASS_TIMEOUT_MIN: "8"
+        run: scripts/scan.sh
 
       - name: Upload findings (always)
         if: always()
