@@ -17,10 +17,3 @@ gitlab.com
 metamask.io
 flipkart.com
 yelp.com
-
-# staging patterns - scanner will expand these heuristics
-staging.%s
-dev.%s
-internal.%s
-canary.%s
-beta.%s
