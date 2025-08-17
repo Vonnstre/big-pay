@@ -38,5 +38,5 @@ VENDORS = {
     "zendesk": {
         "cname_contains": [".zendesk.com"],
         "body_contains": ["Help Center Closed", "Page not found"]
-    }
+    },
 }
