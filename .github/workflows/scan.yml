@@ -1,4 +1,4 @@
-name: scan
+name: Greedy Bounty Scan (≤6h)
 
 on:
   workflow_dispatch:
@@ -11,54 +11,100 @@ on:
 permissions:
   contents: read
 
+env:
+  GOBIN: /home/runner/.local/bin
+
 jobs:
   scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 420
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system deps
+      - name: System deps (Python + build utils)
         run: |
+          set -euxo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq dnsutils unzip git build-essential
+          sudo apt-get install -y --no-install-recommends jq dnsutils unzip git build-essential ca-certificates curl
           python3 -m pip install --upgrade pip
-          pip3 install aiohttp tldextract
+          pip3 install --user aiohttp tldextract
 
-      - name: Setup Go
+      - name: Setup Go (stable)
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.22.x"
 
-      - name: Install Go tools
+      - name: Go cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            ${{ env.GOBIN }}
+          key: go-${{ runner.os }}-${{ hashFiles('**/go.sum') || 'none' }}
+
+      - name: Install Go tools (robust, absolute GOBIN)
         run: |
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          go install -v github.com/owasp-amass/amass/v4/...@latest
+          set -euxo pipefail
+          mkdir -p "${GOBIN}"
+          echo "${GOBIN}" >> "$GITHUB_PATH"
+          export PATH="${GOBIN}:$PATH"
+          go env -w GOBIN="${GOBIN}" || true
+          go env -w GOSUMDB=off || true
+          go env -w GOPROXY="https://proxy.golang.org,https://goproxy.io,direct" || true
+
+          go_install_retry() {
+            pkg="$1"; tries=5; wait=3
+            for i in $(seq 1 $tries); do
+              echo "::group::go install attempt $i -> $pkg"
+              if GOBIN="${GOBIN}" go install -v "$pkg"; then
+                echo "ok: $pkg"
+                echo "::endgroup::"
+                return 0
+              fi
+              echo "retrying in ${wait}s"
+              echo "::endgroup::"
+              sleep "$wait"
+              wait=$((wait*2))
+            done
+            echo "::error::failed to install $pkg"
+            return 1
+          }
+
+          go_install_retry github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go_install_retry github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+          go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go_install_retry github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go_install_retry github.com/owasp-amass/amass/v4/...@latest
+
+          # Smoke checks (hard fail if missing)
+          command -v subfinder >/dev/null || (echo "::error::subfinder not found" && exit 1)
+          command -v dnsx >/dev/null || (echo "::error::dnsx not found" && exit 1)
+          command -v httpx >/dev/null || (echo "::error::httpx not found" && exit 1)
+          command -v nuclei >/dev/null || (echo "::error::nuclei not found" && exit 1)
+          command -v amass >/dev/null || (echo "::error::amass not found" && exit 1)
+
           nuclei -update-templates -silent || true
 
       - name: Make scripts executable
         run: chmod +x scan.sh
 
-      - name: Run scan (requires manual confirm=True)
+      - name: Run scan (manual confirm=True required)
         env:
           SCAN_CONFIRM: ${{ github.event.inputs.confirm }}
-          GLOBAL_CONCURRENCY: "10"         # across roots
-          PER_TARGET_CONCURRENCY: "12"     # inside smart checks
+          # Global knobs — tuned for ≤6h typical bounty inputs (adjust on dispatch if needed)
+          GLOBAL_CONCURRENCY: "10"          # across roots
+          PER_TARGET_CONCURRENCY: "14"      # inside smart checks
           AMASS_TIMEOUT_MIN: "10"
           SUBFINDER_SOURCES: "all"
-          DNSX_WORKERS: "200"
-          HTTPX_THREADS: "150"
+          DNSX_WORKERS: "220"
+          HTTPX_THREADS: "160"
           HTTPX_TIMEOUT: "8"
           NUCLEI_THREADS: "120"
           NUCLEI_RATE_LIMIT: "200"
-          # smart filter knobs
-          MAX_URLS_PER_HOST: "2000"
-          PATH_CHECK_TOP_HOSTS: "200"      # most interesting hosts by httpx signals
+          MAX_URLS_PER_HOST: "1200"         # per host cap (true per-host sampling)
+          PATH_CHECK_TOP_HOSTS: "200"
         run: ./scan.sh
 
       - name: Upload findings
@@ -66,4 +112,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: findings
-          path: findings/
+          path: |
+            findings/**
+            out/**
+            logs/**
