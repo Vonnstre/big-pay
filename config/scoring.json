@@ -1,0 +1,14 @@
+{
+  "exploitability": {
+    "cors": 9,
+    "redirect_in_auth": 8,
+    "takeover": 7
+  },
+  "impact": {
+    "auth_data_read": 9,
+    "phishing": 7
+  },
+  "noise_penalty_default": 2,
+  "auto_draft_threshold": 50,
+  "manual_threshold": 35
+}
