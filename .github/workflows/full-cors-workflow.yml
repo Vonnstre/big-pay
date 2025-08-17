@@ -2,11 +2,6 @@ name: Full CORS & GraphQL Audit
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - hosts.txt
-      - scripts/**
-      - .github/workflows/full-cors-workflow.yml
 
 jobs:
   probe:
@@ -25,9 +20,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pillow pytesseract
 
-      - name: Install tesseract (for OCR fallback)
+      - name: Install tesseract (optional for OCR)
         run: |
-          # optional, required only if you plan to run OCR on PNGs
           sudo apt-get update -y
           sudo apt-get install -y tesseract-ocr
 
@@ -48,7 +42,7 @@ jobs:
         run: |
           python scripts/generate_pocs.py
 
-      - name: Save artifacts (zip)
+      - name: Prepare archive
         run: |
           ls -lah out || true
           ls -lah pocs || true
