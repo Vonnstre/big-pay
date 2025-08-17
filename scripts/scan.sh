@@ -1,139 +1,137 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Aggressive, wide-scope recon funnel.
-# Requires SCAN_CONFIRM="True" (set by workflow input).
-
-# Tunables (override via env)
-GLOBAL_CONCURRENCY="${GLOBAL_CONCURRENCY:-8}"
-PER_TARGET_CONCURRENCY="${PER_TARGET_CONCURRENCY:-8}"
-HTTPX_THREADS="${HTTPX_THREADS:-200}"
-HTTPX_TIMEOUT="${HTTPX_TIMEOUT:-10}"
-NUCLEI_THREADS="${NUCLEI_THREADS:-120}"
-NUCLEI_RATE_LIMIT="${NUCLEI_RATE_LIMIT:-140}"
-NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-low,medium,high,critical}"
-AMASS_TIMEOUT_MIN="${AMASS_TIMEOUT_MIN:-8}"
-
+# ========= guard =========
 SCAN_CONFIRM="${SCAN_CONFIRM:-False}"
-
-root() { realpath "$(dirname "$0")/.."; }
-REPO_ROOT="$(root)"
-
-cd "$REPO_ROOT"
-
-# Safety gate
 if [[ "$SCAN_CONFIRM" != "True" ]]; then
-  echo "[!] SCAN_CONFIRM must be exactly 'True'. Aborting."
+  echo "[!] Aborting: you must type the exact string 'True' when dispatching the workflow."
   exit 1
 fi
 
-# Tool sanity (soft for optional tools)
-need() { command -v "$1" >/dev/null 2>&1 || { echo "[!] Missing required tool: $1"; exit 1; }; }
-need jq
-need python3
-# subfinder/amass/httpx/nuclei are optional but recommended
-for opt in subfinder amass httpx nuclei; do
-  command -v "$opt" >/dev/null 2>&1 || echo "[i] Optional tool not found: $opt (continuing)"
-done
+# ========= config =========
+GLOBAL_CONCURRENCY="${GLOBAL_CONCURRENCY:-8}"
+PER_TARGET_CONCURRENCY="${PER_TARGET_CONCURRENCY:-10}"
 
-mkdir -p out findings logs
+AMASS_TIMEOUT_MIN="${AMASS_TIMEOUT_MIN:-8}"
+SUBFINDER_SOURCES="${SUBFINDER_SOURCES:-all}"
+DNSX_WORKERS="${DNSX_WORKERS:-200}"
+
+HTTPX_THREADS="${HTTPX_THREADS:-120}"
+HTTPX_TIMEOUT="${HTTPX_TIMEOUT:-8}"
+
+NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-low,medium,high,critical}"
+NUCLEI_THREADS="${NUCLEI_THREADS:-100}"
+NUCLEI_RATE_LIMIT="${NUCLEI_RATE_LIMIT:-180}"
+
+MAX_URLS_PER_HOST="${MAX_URLS_PER_HOST:-2000}"
+PATH_CHECK_TOP_HOSTS="${PATH_CHECK_TOP_HOSTS:-150}"
+
+mkdir -p out findings state logs
 : > out/summary.txt
 
-# Load roots
-mapfile -t ROOTS < <(grep -vE '^\s*(#|$)' hosts.txt | sed 's/\r$//' | sort -u)
-if [[ ${#ROOTS[@]} -eq 0 ]]; then
-  echo "[!] hosts.txt is empty."
-  exit 1
-fi
+# ========= tool check =========
+need=(jq subfinder dnsx httpx nuclei amass)
+for t in "${need[@]}"; do
+  command -v "$t" >/dev/null 2>&1 || { echo "[!] missing tool: $t"; exit 1; }
+done
 
-ensure_dir() { mkdir -p "$@"; }
+# ========= load targets =========
+mapfile -t ROOTS < <(grep -vE '^\s*(#|$)' hosts.txt | sed 's/\r$//' | tr ' ' '\n' | sed '/^$/d' | sort -u)
+((${#ROOTS[@]})) || { echo "[!] hosts.txt empty"; exit 1; }
+
+echo "[*] Roots: ${#ROOTS[@]} | global conc: ${GLOBAL_CONCURRENCY} | per-target conc: ${PER_TARGET_CONCURRENCY}"
+
+# ========= functions =========
+ensure_dir(){ mkdir -p "$1"; }
 
 scan_one() {
-  target="$1"
-  safe="$(echo "$target" | sed 's#[^A-Za-z0-9._-]#_#g')"
-  work="out/$safe"
-  fdir="findings/$safe"
-  ensure_dir "$work" "$fdir"
+  local root="$1"
+  local safe="$(echo "$root" | sed 's#[/:]#_#g')"
+  local work="out/$safe"
+  local finddir="findings/$safe"
+  ensure_dir "$work" "$finddir"
 
-  echo "[+] START $target"
+  echo "[+] START $root"
 
-  # ---------- 1) Subdomain discovery (volume) ----------
-  : > "$work/all_subs.raw"
-  if command -v subfinder >/dev/null 2>&1; then
-    subfinder -d "$target" -all -silent >> "$work/all_subs.raw" || true
-  fi
-  if command -v amass >/dev/null 2>&1; then
-    amass enum -passive -d "$target" -timeout "${AMASS_TIMEOUT_MIN}m" -silent >> "$work/all_subs.raw" || true
-  fi
-  # seed likely environments
-  printf "%s\n" \
-    "admin.$target" "internal.$target" "staging.$target" "preview.$target" \
-    "dev.$target" "qa.$target" "test.$target" "uat.$target" "beta.$target" \
-    "sandbox.$target" "canary.$target" >> "$work/all_subs.raw"
+  # 1) SUBDOMAIN DISCOVERY (wide)
+  subfinder -silent -d "$root" -all -sources "$SUBFINDER_SOURCES" -o "$work/subs.subfinder.txt" || true
+  amass enum -passive -d "$root" -timeout "${AMASS_TIMEOUT_MIN}m" -silent -o "$work/subs.amass.txt" || true
 
-  sort -u "$work/all_subs.raw" | sed '/^$/d' > "$work/subs.txt"
-  echo "[*] ${target}: subs=$(wc -l < "$work/subs.txt")"
+  # seed common env names
+  cat > "$work/seed.txt" <<EOF
+staging.$root
+dev.$root
+qa.$root
+test.$root
+uat.$root
+preview.$root
+canary.$root
+int.$root
+internal.$root
+beta.$root
+alpha.$root
+sandbox.$root
+EOF
 
-  # Bail early if nothing
-  if [[ ! -s "$work/subs.txt" ]]; then
-    echo "[-] No subs for $target"
-    return 0
-  }
+  cat "$work"/subs.*.txt "$work/seed.txt" 2>/dev/null \
+    | sed '/^$/d' | sort -u > "$work/subs.all.txt"
 
-  # ---------- 2) Probe & filter with httpx ----------
-  echo "[]" > "$work/httpx.jsonl"
-  if command -v httpx >/dev/null 2>&1; then
-    # httpx writes JSON lines with -json
-    httpx -l "$work/subs.txt" -silent -threads "$HTTPX_THREADS" -timeout "$HTTPX_TIMEOUT" \
-      -follow-redirects -no-color -status-code -title -tech-detect -ip -websocket -json \
-      > "$work/httpx.jsonl" || true
-  else
-    # fallback: synthesize URLs so later steps still run
-    awk '{print "https://" $0 "/"}' "$work/subs.txt" | jq -R '{url: .}' > "$work/httpx.jsonl"
-  fi
+  echo "[*] $(wc -l < "$work/subs.all.txt") subs (pre-resolve) for $root"
 
-  # Keep unique URLs, prefer 200-399, drop obvious noise
-  jq -r '
-    select(.url!=null)
-    | select((.status_code|tonumber? // 0) > 0)
-    | .url' "$work/httpx.jsonl" \
-    | awk '!seen[$0]++' > "$work/alive.urls"
+  # 2) RESOLVE (dnsx) -> only alive names
+  dnsx -silent -l "$work/subs.all.txt" -a -aaaa -cname -resp -retries 1 -w "$DNSX_WORKERS" -json \
+    > "$work/dnsx.json" || true
+  jq -r 'select(.a!=null or .aaaa!=null or .cname!=null) | .host' "$work/dnsx.json" \
+    | sort -u > "$work/resolved.txt"
 
-  echo "[*] ${target}: alive=$(wc -l < "$work/alive.urls")"
+  echo "[*] $(wc -l < "$work/resolved.txt") resolved hosts for $root"
 
-  # ---------- 3) Smart filter (your Python) ----------
-  python3 scripts/smart_hunt.py \
-    --target "$target" \
-    --httpx-json "$work/httpx.jsonl" \
-    --outdir "$fdir" \
-    --per-target "$PER_TARGET_CONCURRENCY" || true
+  # 3) PROBE (httpx) — collect rich JSON
+  httpx -l "$work/resolved.txt" -silent \
+    -follow-host-redirects -status-code -tech-detect -title -content-type \
+    -ip -cname -cdn -websocket -tls-grab \
+    -threads "$HTTPX_THREADS" -timeout "$HTTPX_TIMEOUT" -retries 1 -json \
+    > "$work/httpx.json" || true
 
-  # ---------- 4) Nuclei (optional, folded into findings) ----------
-  if command -v nuclei >/dev/null 2>&1 && [[ -s "$work/alive.urls" ]]; then
-    nuclei -l "$work/alive.urls" \
-      -severity "$NUCLEI_SEVERITY" \
-      -rl "$NUCLEI_RATE_LIMIT" -c "$NUCLEI_THREADS" \
-      -retries 1 -no-meta -json -silent \
-      -o "$work/nuclei.jsonl" || true
+  # cap & extract live URLs (smart sample for volume control)
+  jq -r 'select(.url!=null) | .url' "$work/httpx.json" \
+    | sed 's#/*$##' \
+    | head -n "$MAX_URLS_PER_HOST" > "$work/alive.sample.txt" || true
 
-    python3 scripts/smart_hunt.py \
-      --target "$target" \
-      --nuclei-json "$work/nuclei.jsonl" \
-      --outdir "$fdir" \
-      --fold-nuclei || true
-  fi
+  echo "[*] $(wc -l < "$work/alive.sample.txt") live URLs (sample) for $root"
 
-  # Append target summary
-  [[ -f "$fdir/summary.txt" ]] && cat "$fdir/summary.txt" >> out/summary.txt
+  # 4) SMART & GREEDY LOW/MED HUNT (custom)
+  python3 smart_hunt.py \
+    --target "$root" \
+    --httpx-json "$work/httpx.json" \
+    --alive "$work/alive.sample.txt" \
+    --outdir "$finddir" \
+    --per-target "$PER_TARGET_CONCURRENCY" \
+    --path-check-top-hosts "$PATH_CHECK_TOP_HOSTS"
 
-  echo "[+] DONE $target"
+  # 5) OPTIONAL NUCLEI (only on alive sample to keep speed)
+  nuclei -l "$work/alive.sample.txt" \
+    -severity "$NUCLEI_SEVERITY" \
+    -rl "$NUCLEI_RATE_LIMIT" -c "$NUCLEI_THREADS" -retries 1 -bulk-size 60 \
+    -json -stats -no-meta -o "$work/nuclei.json" || true
+
+  python3 smart_hunt.py \
+    --target "$root" \
+    --nuclei-json "$work/nuclei.json" \
+    --outdir "$finddir" \
+    --fold-nuclei
+
+  # 6) per-target summary fold
+  [[ -f "$finddir/summary.txt" ]] && cat "$finddir/summary.txt" >> out/summary.txt
+
+  echo "[+] DONE $root"
 }
 
 export -f scan_one
-export PER_TARGET_CONCURRENCY
 
+# ========= run fan-out =========
 printf "%s\n" "${ROOTS[@]}" | xargs -n1 -P "$GLOBAL_CONCURRENCY" -I{} bash -c 'scan_one "$@"' _ {}
 
 echo
-echo "===== RUN SUMMARY ====="
-[[ -f out/summary.txt ]] && cat out/summary.txt || echo "No findings."
+echo "======== RUN SUMMARY ========"
+cat out/summary.txt || true
