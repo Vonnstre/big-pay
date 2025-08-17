@@ -1,8 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# scan.sh — aggressive funnel (requires SCAN_CONFIRM="True" when run from workflow)
 
-# Configurable (tune via env)
+echo "[*] scan.sh starting..."
+
+# Validate confirmation
+if [ "${SCAN_CONFIRM-}" != "True" ]; then
+  echo "ERROR: SCAN_CONFIRM is not 'True'. Aborting."
+  exit 1
+fi
+
+# Paths check
+for f in hosts.txt smart_hunt.py vendor_fingerprints.py; do
+  if [ ! -f "$f" ]; then
+    echo "ERROR: Required file '$f' missing."
+    exit 1
+  fi
+done
+
+# Set defaults
 GLOBAL_CONCURRENCY="${GLOBAL_CONCURRENCY:-6}"
 PER_TARGET_CONCURRENCY="${PER_TARGET_CONCURRENCY:-6}"
 HTTPX_THREADS="${HTTPX_THREADS:-40}"
@@ -12,94 +27,64 @@ NUCLEI_RATE_LIMIT="${NUCLEI_RATE_LIMIT:-80}"
 NUCLEI_THREADS="${NUCLEI_THREADS:-40}"
 AMASS_TIMEOUT_MIN="${AMASS_TIMEOUT_MIN:-6}"
 
-# Safety: must explicitly confirm in manual workflow with the exact string "True"
-SCAN_CONFIRM="${SCAN_CONFIRM:-False}"
-
-# Basic paths
+# Prepare outputs
 mkdir -p out findings state logs
 : > out/summary.txt
 
-echo "[*] Starting funnel. GLOBAL_CONCURRENCY=${GLOBAL_CONCURRENCY}"
-
-# Require exact confirmation
-if [[ "${SCAN_CONFIRM}" != "True" ]]; then
-  echo "[!] SCAN_CONFIRM not set to the exact string 'True'."
-  echo "    When running the GitHub workflow manually, type True into the 'confirm' input."
-  echo "    Locally you can export SCAN_CONFIRM=True before running."
-  exit 1
-fi
-
-# Basic required tools check (fail early)
-required=(jq xargs amass)
-for t in "${required[@]}"; do
-  if ! command -v "$t" >/dev/null 2>&1; then
-    echo "[!] Required tool missing: $t. Install before running."
-    exit 1
-  fi
-done
-
-# load hosts (one per line)
+# Load targets
 mapfile -t ROOTS < <(grep -vE '^\s*(#|$)' hosts.txt | sed 's/\r$//' | sort -u)
-if [[ ${#ROOTS[@]} -eq 0 ]]; then
-  echo "[!] hosts.txt is empty - provide targets and retry."
+if [ ${#ROOTS[@]} -eq 0 ]; then
+  echo "ERROR: hosts.txt is empty."
   exit 1
 fi
 
-# helper to ensure directories and safe names
-ensure_dir() { mkdir -p "$1"; }
-
-# per-target scan function
+# scan_one function
 scan_one() {
-  target="$1"
-  safe="$(echo "$target" | sed 's#[/:]#_#g')"
+  root="$1"
+  safe="$(echo "$root" | sed 's#[/:]#_#g')"
   work="out/$safe"
-  finddir="findings/$safe"
-  ensure_dir "$work" "$finddir"
+  findir="findings/$safe"
+  mkdir -p "$work" "$findir"
 
-  echo "[+] START $target"
+  echo "[+] START $root"
 
-  # 1) passive discovery (bounded)
-  amass enum -passive -d "$target" -timeout "${AMASS_TIMEOUT_MIN}m" -silent -o "$work/subs.passive.txt" || true
+  amass enum -passive -d "$root" -timeout "${AMASS_TIMEOUT_MIN}m" -silent -o "$work/subs.passive.txt" || true
 
-  # seed common staging hosts
   for p in staging dev qa test uat preview canary int internal beta alpha sandbox; do
-    echo "https://$p.$target"
+    echo "https://$p.$root"
   done | sort -u > "$work/seed.txt"
 
-  # merge subs
-  cat "$work/subs.passive.txt" "$work/seed.txt" 2>/dev/null | sort -u | sed '/^$/d' > "$work/subs.txt" || true
+  cat "$work/subs.passive.txt" "$work/seed.txt" | sort -u | sed '/^$/d' > "$work/subs.txt" || true
 
-  # 2) probe with httpx (if installed)
   if command -v httpx >/dev/null 2>&1; then
-    echo "[*] httpx probing ${target}"
+    echo "[*] httpx probing: $root"
     httpx -l "$work/subs.txt" -silent -follow-host-redirects -status-code -tech-detect -title -json \
       -threads "$HTTPX_THREADS" -timeout "$HTTPX_TIMEOUT" -retries 1 > "$work/httpx.json" || true
   else
+    echo "[*] httpx not installed; skipping probing"
     : > "$work/httpx.json"
   fi
 
-  # 3) smart checks (CORS, redirects, takeover, admin)
-  python3 smart_hunt.py --target "$target" --httpx-json "$work/httpx.json" --outdir "$finddir" --per-target "$PER_TARGET_CONCURRENCY"
+  python3 smart_hunt.py --target "$root" --httpx-json "$work/httpx.json" --outdir "$findir" --per-target "$PER_TARGET_CONCURRENCY"
 
-  # 4) nuclei (if available)
   if command -v nuclei >/dev/null 2>&1; then
-    echo "[*] running nuclei for ${target}"
-    jq -r 'select(.url!=null) | .url' "$work/httpx.json" 2>/dev/null | sed 's#/*$##' > "$work/alive.txt" || echo "https://$target" > "$work/alive.txt"
+    echo "[*] Running nuclei on: $root"
+    jq -r 'select(.url!=null) | .url' "$work/httpx.json" 2>/dev/null | sed 's#/*$##' > "$work/alive.txt" || echo "https://$root" > "$work/alive.txt"
     nuclei -l "$work/alive.txt" -severity "$NUCLEI_SEVERITY" -rl "$NUCLEI_RATE_LIMIT" -c "$NUCLEI_THREADS" -retries 1 -bulk-size 50 -json -stats -no-meta -o "$work/nuclei.json" || true
-    python3 smart_hunt.py --domain "$target" --nuclei-json "$work/nuclei.json" --outdir "$finddir" --fold-nuclei
+    python3 smart_hunt.py --domain "$root" --nuclei-json "$work/nuclei.json" --outdir "$findir" --fold-nuclei
+  else
+    echo "[*] nuclei not installed; skipping nuclei scanning"
   fi
 
-  # append per-target summary
-  if [[ -f "$finddir/summary.txt" ]]; then
-    cat "$finddir/summary.txt" >> out/summary.txt
+  if [ -f "$findir/summary.txt" ]; then
+    cat "$findir/summary.txt" >> out/summary.txt
   fi
 
-  echo "[+] DONE $target"
+  echo "[+] DONE $root"
 }
 
 export -f scan_one
 
-# run with limited parallelism (xargs)
 printf "%s\n" "${ROOTS[@]}" | xargs -n1 -P "$GLOBAL_CONCURRENCY" -I{} bash -c 'scan_one "$@"' _ {}
 
-echo; echo "======== RUN SUMMARY ========"; cat out/summary.txt || true
+echo; echo "===== RUN SUMMARY ====="; cat out/summary.txt || true
