@@ -1,37 +1,48 @@
 #!/usr/bin/env python3
-import argparse, json, requests, time
+import os, json, subprocess, hashlib, re, time
+from urllib.parse import urlparse
 
-parser = argparse.ArgumentParser()
-parser.add_argument('endpoints_json')
-parser.add_argument('--out', default='cors.json')
-parser.add_argument('--origin', default='https://attacker.example')
-args = parser.parse_args()
+SCORING = json.load(open("config/scoring.json"))
 
-with open(args.endpoints_json) as f:
-    endpoints = json.load(f)
+def curl(url, origin):
+    h = [
+        "curl", "-i", "-sS", "-m", "15", "-H", f"Origin: {origin}",
+        "-H", "User-Agent: BB-Funnel/1.0", url
+    ]
+    return subprocess.run(h, capture_output=True, text=True, timeout=20)
 
-results = []
-for host in endpoints.keys():
-    url = 'https://' + host
+def parse_headers(raw):
+    headers={}
+    for line in raw.splitlines():
+        if ":" in line and not line.lower().startswith("http/"):
+            k,v=line.split(":",1)
+            headers[k.strip().lower()]=v.strip()
+    return headers
+
+def run_target(target):
+    tdir=f"findings/{target}"
+    os.makedirs(tdir, exist_ok=True)
     try:
-        headers = {'Origin': args.origin, 'User-Agent': 'agg-scanner/1.0'}
-        r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
-        acao = r.headers.get('Access-Control-Allow-Origin','')
-        acac = r.headers.get('Access-Control-Allow-Credentials','')
-        setcookie = 'Set-Cookie' in r.headers
-        auth_hint = ('WWW-Authenticate' in r.headers) or (r.status_code==401)
-        vulnerable = False
-        reason = ''
-        if acac and acac.lower()=='true' and acao and acao != '*':
-            # require either cookie or auth behavior
-            if setcookie or auth_hint:
-                vulnerable = True
-                reason = f"ACAO={acao} ACAC={acac}"
-        results.append({'host':host,'status':r.status_code,'acao':acao,'acac':acac,'setcookie':setcookie,'auth_hint':auth_hint,'vulnerable':vulnerable,'reason':reason})
-    except Exception as e:
-        results.append({'host':host,'error':str(e)})
-    time.sleep(0.15)
+        endpoints=json.load(open(f"{tdir}/endpoints.json"))
+    except: 
+        return
+    hits=[]
+    for url in endpoints[:800]:  # cap per target
+        origin=f"https://{hashlib.md5(url.encode()).hexdigest()}.evil.tld"
+        r=curl(url, origin)
+        raw=r.stdout
+        if not raw: continue
+        headers=parse_headers(raw)
+        acao=headers.get("access-control-allow-origin","")
+        acac=headers.get("access-control-allow-credentials","").lower()
+        setcookie=True if "set-cookie" in headers else False
+        auth_header=any(k in headers for k in ["www-authenticate","authorization"])
+        # tight signature
+        if acac=="true" and acao==origin and (setcookie or auth_header):
+            hits.append({"url":url,"acao":acao,"acac":acac,"set_cookie":setcookie,"auth_hdr":auth_header})
+    with open(f"{tdir}/cors.json","w") as f:
+        json.dump(hits,f,indent=2)
 
-with open(args.out,'w') as f:
-    json.dump(results,f,indent=2)
-print(f"[+] cors -> {args.out}")
+if __name__=="__main__":
+    import sys
+    run_target(sys.argv[1])
