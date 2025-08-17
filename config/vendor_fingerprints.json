@@ -1,0 +1,7 @@
+{
+  "netlify": { "domains": ["netlify.app","netlify.com"], "needle": "no such site" },
+  "vercel": { "domains": ["vercel.app","now.sh"], "needle": "vercel" },
+  "s3": { "domains": ["s3.amazonaws.com","amazonaws.com"], "needle": "nosuchbucket" },
+  "github_pages": { "domains": ["github.io"], "needle": "there isn't a github pages site here" },
+  "cloudflare_pages": { "domains": ["pages.dev"], "needle": "404 not found" }
+}
