@@ -1,6 +1,25 @@
-accounts.api.cx.metamask.io
-accounts.dev-api.cx.metamask.io
-accounts.uat-api.cx.metamask.io
-account.api.cx.metamask.io
-accounts-us-east-2.api.cx.metamask.io
-adapter-us-east-2.api.cx.metamask.io
+shopify.com
+netlify.com
+vercel.com
+fastly.com
+temu.com
+epicgames.com
+acronis.com
+polygon.technology
+pingidentity.com
+grammarly.com
+plaid.com
+crowdstrike.com
+airbnb.com
+crypto.com
+bitmex.com
+gitlab.com
+metamask.io
+flipkart.com
+yelp.com
+
+# common derivations (the scanner will expand these heuristics)
+# {{target}}.staging
+# staging.{{target}}
+# dev.{{target}}
+# internal.{{target}}
