@@ -1,34 +1,48 @@
 #!/usr/bin/env python3
 """
-smart_hunt.py — greedy Low/Med harvester:
-- Inputs: httpx JSON + alive sample list
-- Targets: CORS creds, auth redirects, admin panels, takeover, dir listing,
-           exposed .git/.env, backup dumps, GraphQL introspection
-- Output: per-finding evidence zip + summary
+smart_hunt.py — greedy Low/Med harvester
+
+Inputs:
+  - httpx JSON (jsonl) + alive sample list
+  - optional nuclei jsonl (fold mode)
+
+Targets:
+  - CORS w/ credentials + reflected origin
+  - Auth redirects (open redirect on auth flows)
+  - Admin panels w/o auth wall
+  - Dir listing
+  - Exposed .git / .env
+  - Backup artifacts
+  - Subdomain takeover banners (lightweight)
+  - GraphQL introspection enabled
+
+Output:
+  - Per-finding evidence folder zipped + summary lines
 """
+
 import argparse, asyncio, aiohttp, os, json, hashlib, re, time, zipfile
 from collections import defaultdict, Counter
 from urllib.parse import urlparse, urlencode, urlunparse, parse_qsl
 from vendor_fingerprints import VENDORS
 
 # ---------- helpers ----------
-REDACTION_PATTERNS = [
-    re.compile(r'(api|secret|token|key|pwd|pass|bearer|authorization)[=:]\s*([A-Za-z0-9._\-]{8,})', re.I),
-    re.compile(r'["\']([A-Za-z0-9_\-]{16,})["\']')
-]
 
-AUTH_HINT = re.compile(r'(login|sign[\s_-]*in|reset password|2fa|mfa|oauth|authorize)', re.I)
-ADMIN_MARKERS = re.compile(r'grafana|kibana|jenkins|sonarqube|nexus repository|pgadmin|prometheus|kubernetes dashboard|rabbitmq|airflow|superset|laravel horizon', re.I)
+REDACTION_PATTERNS = [
+    re.compile(r'(?:api|secret|token|key|pwd|pass|bearer|authorization)[=:]\s*([A-Za-z0-9._-]{8,})', re.I),
+]
+AUTH_HINT = re.compile(r'(login|sign[\s_-]*in|reset\s*password|2fa|mfa|oauth|authorize)', re.I)
+ADMIN_MARKERS = re.compile(
+    r'(grafana|kibana|jenkins|sonarqube|nexus\s+repository|pgadmin|prometheus|kubernetes\s+dashboard|'
+    r'rabbitmq|airflow|superset|laravel\s+horizon|minio\s+console|gitlab|portainer)', re.I)
 
 DIRLIST_MARKERS = re.compile(r'Index of /|<title>Index of', re.I)
 GIT_HEAD_MARKER = re.compile(r'^ref:\s+refs/heads/', re.I | re.M)
-ENV_MARKERS = re.compile(r'(APP_KEY|DB_PASSWORD|DB_HOST|SECRET|AWS_|\bREDIS_|TOKEN=)', re.I)
+ENV_MARKERS = re.compile(r'(APP_KEY|DB_PASSWORD|DB_HOST|SECRET|AWS_|REDIS_|TOKEN=)', re.I)
 
-# scoring normalized 0..100 tilted to Low/Med
 BASE = {
-    "dirlist": 0.65, "env": 0.75, "git": 0.7,
-    "cors": 0.85 if True else 0.6, "redirect_auth": 0.78,
-    "admin": 0.72, "takeover": 0.88, "backup": 0.7, "graphql": 0.68, "nuclei": 0.6
+    "dirlist": 0.65, "env": 0.80, "git": 0.72,
+    "cors": 0.85, "redirect_auth": 0.78,
+    "admin": 0.72, "takeover": 0.88, "backup": 0.75, "graphql": 0.68, "nuclei": 0.60
 }
 AUTO_DRAFT_THRESHOLD = 45
 
@@ -41,11 +55,19 @@ def score(kind, auth=False, signal=1.0):
 def sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
+def redact_bytes(b: bytes) -> bytes:
+    text = b.decode(errors="ignore")
+    for rx in REDACTION_PATTERNS:
+        text = rx.sub(r"\1[REDACTED]", text)
+    return text.encode()
+
 def redacted_snippet(b: bytes, limit_kb=64):
     if len(b) > limit_kb*1024:
-        head = b[:200]; tail = b[-200:]; h = sha256(b)
+        body = redact_bytes(b)
+        head = body[:200]; tail = body[-200:]; h = sha256(body)
         return h, head, tail, True
-    return sha256(b), b, b"", False
+    body = redact_bytes(b)
+    return sha256(body), body, b"", False
 
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
@@ -58,22 +80,21 @@ def base_of(u):
     pu = urlparse(u)
     return f"{pu.scheme}://{pu.hostname}" + (f":{pu.port}" if pu.port else "")
 
-def mkcurl(url, headers=None):
-    h = headers or {}; parts = ' '.join([f"-H '{k}: {v}'" for k,v in h.items()])
-    return f"curl -i -s '{url}' {parts}"
-
 # ---------- HTTP ----------
+DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=10, sock_read=15, sock_connect=10)
+
 async def fetch(session, method, url, headers=None, allow_redirects=False):
     try:
-        async with session.request(method, url, headers=headers or {}, allow_redirects=allow_redirects, timeout=15) as r:
+        async with session.request(method, url, headers=headers or {}, allow_redirects=allow_redirects) as r:
             b = await r.read()
             return dict(ok=True, status=r.status, url=str(r.url),
-                        headers={k.lower(): v for k,v in r.headers.items()},
+                        headers={k.lower(): v for k, v in r.headers.items()},
                         body=b)
     except Exception as e:
         return dict(ok=False, status=0, error=str(e), url=url, headers={}, body=b"")
 
 # ---------- checks (easy L/M) ----------
+
 async def check_dirlisting(session, url):
     r = await fetch(session, "GET", url)
     if r["ok"] and r["status"] == 200 and DIRLIST_MARKERS.search(r["body"].decode(errors="ignore")):
@@ -116,13 +137,16 @@ async def check_cors(session, url):
     test = await fetch(session, "GET", url, headers={"Origin": origin, "Cookie": "session=stub"})
     if not base["ok"] or not test["ok"]:
         return None
-    h = {k.lower():v for k,v in test["headers"].items()}
+    h = test["headers"]
     acao = h.get("access-control-allow-origin","")
     acac = h.get("access-control-allow-credentials","")
     set_cookie = "set-cookie" in h
     authish = set_cookie or ("www-authenticate" in h) or base["status"] in (401,403)
+    # Creds + reflected origin (not wildcard)
     if acac.lower() == "true" and acao and acao != "*" and origin in acao:
-        return dict(kind="cors", auth=authish, base=base, test=test, origin=origin)
+        out = dict(kind="cors", auth=authish, base=base, test=test, origin=origin)
+        out["url"] = url
+        return out
     return None
 
 async def check_admin_panel(session, url):
@@ -131,7 +155,6 @@ async def check_admin_panel(session, url):
         return None
     text = r["body"].decode(errors="ignore")
     if ADMIN_MARKERS.search(text) and not re.search(r'csrf token|forbidden', text, re.I):
-    # found a recognizable dashboard without auth wall
         return dict(kind="admin", resp=r)
     return None
 
@@ -143,12 +166,12 @@ async def check_backup_files(session, url_base):
     tasks = [fetch(session,"GET", url_base+p) for p in candidates]
     rs = await asyncio.gather(*tasks, return_exceptions=False)
     for r,p in zip(rs,candidates):
-        if r["ok"] and r["status"] == 200 and len(r["body"]) > 512:  # crude but effective
+        if r["ok"] and r["status"] == 200 and len(r["body"]) > 512:
             return dict(kind="backup", resp=r, url=url_base+p)
     return None
 
-def takeover_from_text(body: str, headers: dict):
-    blob = body.lower() + "\n" + json.dumps(headers).lower()
+def takeover_from_text(body: str, headers: dict, cnames: list[str] | None = None):
+    blob = (body or "").lower() + "\n" + json.dumps(headers or {}).lower()
     for vendor, fp in VENDORS.items():
         for sig in fp.get("body_contains", []):
             if sig.lower() in blob:
@@ -156,6 +179,10 @@ def takeover_from_text(body: str, headers: dict):
         for sig in fp.get("header_contains", []):
             if sig.lower() in blob:
                 return vendor
+        if cnames:
+            for c in cnames:
+                if any(s in c.lower() for s in fp.get("cname_contains", [])):
+                    return vendor
     return None
 
 async def check_takeover(session, host, scheme="https"):
@@ -168,7 +195,23 @@ async def check_takeover(session, host, scheme="https"):
         return dict(kind="takeover", vendor=vendor, resp=r)
     return None
 
+GRAPHQL_INTROSPECTION_QUERY = {"query": "{ __schema { types { name } } }"}
+
+async def check_graphql(session, base_url):
+    # try GET and POST variants
+    get_url = with_query(base_url + "/graphql", {"query": "{__schema{types{name}}}"})
+    r1 = await fetch(session, "GET", get_url)
+    r2 = await fetch(session, "POST", base_url + "/graphql",
+                     headers={"content-type": "application/json"},
+                     allow_redirects=False)
+    body1 = r1["body"].decode(errors="ignore") if r1["ok"] else ""
+    body2 = r2["body"].decode(errors="ignore") if r2["ok"] else ""
+    if ("__schema" in body1) or ("__schema" in body2):
+        return dict(kind="graphql", resp=(r1 if "__schema" in body1 else r2), url=base_url + "/graphql")
+    return None
+
 # ---------- evidence ----------
+
 def write_evidence(base_dir, finding, target):
     ensure_dir(base_dir)
     now = int(time.time())
@@ -192,6 +235,11 @@ def write_evidence(base_dir, finding, target):
         h, head, tail, clipped = redacted_snippet(resp.get("body", b""))
         with open(os.path.join(fdir,f"{prefix}_summary.txt"),"w",encoding="utf-8",errors="ignore") as fh:
             fh.write(f"URL: {resp.get('url')}\nStatus: {resp.get('status')}\n\nHeaders:\n{hdrs}\n\nBodySHA256: {h}\nClipped: {clipped}\n")
+        # keep tiny snippets for quick eyeballing
+        with open(os.path.join(fdir,f"{prefix}_head.bin"),"wb") as fh: fh.write(head)
+        if tail:
+            with open(os.path.join(fdir,f"{prefix}_tail.bin"),"wb") as fh: fh.write(tail)
+
     for k in ("base","test","resp"):
         if k in finding: dump_resp(k, finding[k])
 
@@ -207,39 +255,51 @@ def write_evidence(base_dir, finding, target):
     with open(os.path.join(fdir,"finding.md"),"w") as fh:
         fh.write(f"# {ftype.upper()} (auto)\nTarget: {target}\nURL/Host: {meta.get('url')}\nScore: {meta['score']}\nNotes: {meta['notes']}\n")
 
-    zpath = os.path.join(base_dir, f"{fid}.zip")
+    zpath = os.path.join(base_dir, f"{fid}.evidence.zip")
     with zipfile.ZipFile(zpath,"w",zipfile.ZIP_DEFLATED) as z:
         for fn in os.listdir(fdir):
             z.write(os.path.join(fdir,fn), arcname=fn)
     return fid
 
 # ---------- orchestrator ----------
+
 async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path_check_top_hosts):
     ensure_dir(outdir)
 
     # Parse httpx JSON lines
-    urls, titles, techs, by_host = [], {}, defaultdict(set), defaultdict(list)
+    urls, titles, by_host = [], {}, defaultdict(list)
+    techs = defaultdict(set)
     schemes = defaultdict(lambda: "https")
+    cnames = defaultdict(list)
+
     if httpx_json and os.path.isfile(httpx_json):
         with open(httpx_json,"r",encoding="utf-8",errors="ignore") as fh:
             for line in fh:
                 try:
                     j = json.loads(line)
-                except: continue
+                except Exception:
+                    continue
                 u = j.get("url"); h = j.get("host"); t = (j.get("title") or "")
                 if not u or not h: continue
                 u = u.rstrip("/")
                 urls.append(u); titles[u] = t
                 schemes[h] = j.get("scheme","https")
+                # httpx sets "tech" when -tech-detect
                 for tech in (j.get("tech","") or "").split(","):
                     if tech.strip(): techs[h].add(tech.strip().lower())
+                # cnames (can be list or string depending on build)
+                cval = j.get("cname")
+                if isinstance(cval, list):
+                    cnames[h].extend([str(x) for x in cval])
+                elif isinstance(cval, str) and cval:
+                    cnames[h].append(cval)
                 by_host[h].append(u)
 
     alive = []
     if alive_file and os.path.isfile(alive_file):
         alive = [l.strip() for l in open(alive_file,"r",encoding="utf-8",errors="ignore") if l.strip()]
 
-    # Rank hosts by interestingness (more login/admin keywords, tech hints)
+    # Rank hosts by interestingness
     host_scores = Counter()
     for h, lst in by_host.items():
         t_hits = sum(1 for u in lst if AUTH_HINT.search(titles.get(u,"")))
@@ -247,19 +307,23 @@ async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path
         host_scores[h] = (2*t_hits) + tech_hits + len(lst)/50.0
 
     top_hosts = [h for h,_ in host_scores.most_common(path_check_top_hosts or 100)]
-    # Build path candidates on BASE of each host
     base_urls = [f"{schemes[h]}://{h}" for h in top_hosts]
 
     findings = []
     sem = asyncio.Semaphore(per_target)
-    async with aiohttp.ClientSession() as session:
-        async def bounded(fn, *a, **kw):
-            async with sem: return await fn(*a, **kw)
+    conn = aiohttp.TCPConnector(limit=per_target*4, ssl=False)
+    async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT, connector=conn) as session:
 
-        # 1) Per-URL checks that use live endpoints list (auth redirects, CORS, admin)
-        cors_tasks   = [bounded(check_cors, session, u) for u in alive]
-        redir_tasks  = [bounded(check_redirects, session, u) for u in alive]
-        admin_tasks  = [bounded(check_admin_panel, session, u) for u in alive if ("admin" in u or "dashboard" in u or AUTH_HINT.search(titles.get(u,"")))]
+        async def bounded(fn, *a, **kw):
+            async with sem:
+                return await fn(*a, **kw)
+
+        # 1) Per-URL checks (CORS, redirects, admin)
+        cors_tasks  = [bounded(check_cors, session, u) for u in alive]
+        redir_tasks = [bounded(check_redirects, session, u) for u in alive]
+        admin_candidates = [u for u in alive if ("admin" in u or "dashboard" in u or AUTH_HINT.search(titles.get(u,"")))]
+        admin_tasks = [bounded(check_admin_panel, session, u) for u in admin_candidates]
+
         cors_res, redir_res, admin_res = await asyncio.gather(
             asyncio.gather(*cors_tasks), asyncio.gather(*redir_tasks), asyncio.gather(*admin_tasks)
         )
@@ -268,45 +332,58 @@ async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path
             if r:
                 s = score("cors", auth=r.get("auth", False), signal=1.0)
                 findings.append(dict(kind="cors", url=u, base=r["base"], test=r["test"], origin=r["origin"], auth=r["auth"], score=s, notes="ACAC:true & ACAO reflects Origin"))
+
         for u, r in zip(alive, redir_res):
             if r:
                 s = score("redirect_auth", auth=True, signal=1.0)
                 r.update(dict(url=u, score=s))
                 findings.append(r)
-        for u, r in zip([u for u in alive if ("admin" in u or "dashboard" in u or AUTH_HINT.search(titles.get(u,"")))], admin_res):
+
+        for u, r in zip(admin_candidates, admin_res):
             if r:
                 s = score("admin", signal=0.9)
                 findings.append(dict(kind="admin", url=u, resp=r["resp"], score=s))
 
-        # 2) Per-host path checks (.env, .git, backup files, dir listing)
-        dir_tasks   = [bounded(check_dirlisting, session, b + "/") for b in base_urls]
-        git_tasks   = [bounded(check_git_exposed, session, b) for b in base_urls]
-        env_tasks   = [bounded(check_env_exposed, session, b) for b in base_urls]
-        bak_tasks   = [bounded(check_backup_files, session, b) for b in base_urls]
-        dir_res, git_res, env_res, bak_res = await asyncio.gather(
+        # 2) Per-host path checks (.env, .git, backup files, dir listing, graphql)
+        dir_tasks = [bounded(check_dirlisting, session, b + "/") for b in base_urls]
+        git_tasks = [bounded(check_git_exposed, session, b) for b in base_urls]
+        env_tasks = [bounded(check_env_exposed, session, b) for b in base_urls]
+        bak_tasks = [bounded(check_backup_files, session, b) for b in base_urls]
+        gql_tasks = [bounded(check_graphql, session, b) for b in base_urls]
+
+        dir_res, git_res, env_res, bak_res, gql_res = await asyncio.gather(
             asyncio.gather(*dir_tasks), asyncio.gather(*git_tasks),
-            asyncio.gather(*env_tasks), asyncio.gather(*bak_tasks)
+            asyncio.gather(*env_tasks), asyncio.gather(*bak_tasks),
+            asyncio.gather(*gql_tasks)
         )
 
         for b, r in zip(base_urls, dir_res):
             if r:
                 s = score("dirlist", signal=0.8)
                 findings.append(dict(kind="dirlist", url=b + "/", resp=r["resp"], score=s, notes="Auto index enabled"))
+
         for b, r in zip(base_urls, git_res):
             if r:
                 s = score("git", signal=0.9)
                 findings.append(dict(kind="git", url=r["url"], resp=r["resp"], score=s, notes="Exposed .git/HEAD"))
+
         for b, r in zip(base_urls, env_res):
             if r:
                 s = score("env", signal=1.0)
                 findings.append(dict(kind="env", url=r["url"], resp=r["resp"], score=s, notes="Exposed .env (secrets likely)"))
+
         for b, r in zip(base_urls, bak_res):
             if r:
                 s = score("backup", signal=0.95)
                 findings.append(dict(kind="backup", url=r["url"], resp=r["resp"], score=s, notes="Backup artifact accessible"))
 
+        for b, r in zip(base_urls, gql_res):
+            if r:
+                s = score("graphql", signal=0.75)
+                findings.append(dict(kind="graphql", url=r["url"], resp=r["resp"], score=s, notes="GraphQL introspection enabled"))
+
         # 3) Subdomain takeover (by host)
-        hosts = list(by_host.keys())
+        hosts = list({h for h in by_host.keys()})
         tk_tasks = [bounded(check_takeover, session, h, schemes.get(h,"https")) for h in hosts]
         tk_res = await asyncio.gather(*tk_tasks)
         for h, r in zip(hosts, tk_res):
@@ -331,7 +408,7 @@ def fold_nuclei(target, nuclei_json, outdir):
     with open(nuclei_json,"r",encoding="utf-8",errors="ignore") as fh:
         for line in fh:
             try: j = json.loads(line)
-            except: continue
+            except Exception: continue
             url = j.get("matched-at") or j.get("host") or j.get("url")
             if not url: continue
             s = score("nuclei", signal=0.7)
