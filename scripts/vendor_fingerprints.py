@@ -1,4 +1,3 @@
-# Minimal vendor fingerprints for takeover candidates (body/header substrings)
 VENDORS = {
     "aws_s3": {
         "cname_contains": [".s3.amazonaws.com", ".s3-website"],
