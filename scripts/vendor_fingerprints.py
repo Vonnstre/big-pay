@@ -1,3 +1,4 @@
+# Minimal vendor fingerprints for takeover/error banners
 VENDORS = {
     "aws_s3": {
         "cname_contains": [".s3.amazonaws.com", ".s3-website"],
@@ -27,10 +28,6 @@ VENDORS = {
         "cname_contains": [".fastly.net"],
         "body_contains": ["Fastly error: unknown domain"]
     },
-    "unbounce": {
-        "cname_contains": [".unbouncepages.com"],
-        "body_contains": ["The requested URL was not found on this server."]
-    },
     "readme": {
         "cname_contains": [".readme.io"],
         "body_contains": ["Project doesnt exist", "We couldn't find the page you were looking for"]
@@ -39,4 +36,8 @@ VENDORS = {
         "cname_contains": [".zendesk.com"],
         "body_contains": ["Help Center Closed", "Page not found"]
     },
+    "surge": {
+        "cname_contains": [".surge.sh"],
+        "body_contains": ["project not found"]
+    }
 }
