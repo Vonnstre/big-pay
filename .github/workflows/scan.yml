@@ -14,48 +14,120 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system deps
+      - name: Show workspace (debug)
+        run: |
+          echo "=== PWD ==="
+          pwd
+          echo "=== LISTING (top-level) ==="
+          ls -la
+          echo "=== LISTING (recursive up to depth=3) ==="
+          find . -maxdepth 3 -type f -printf "%p\n" | sed -n '1,200p'
+
+      - name: Require manual confirm = True
+        run: |
+          echo "[*] Manual 'confirm' input: '${{ github.event.inputs.confirm }}'"
+          if [ "${{ github.event.inputs.confirm }}" != "True" ]; then
+            echo "ERROR: You must type the exact, case-sensitive string 'True' in the workflow 'confirm' input to proceed."
+            echo "This prevents accidental runs. Aborting."
+            exit 1
+          fi
+          echo "[*] Confirm value accepted. Proceeding."
+
+      - name: Install system deps & python libs
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq dnsutils unzip git build-essential
           python3 -m pip install --upgrade pip
           pip3 install aiohttp tldextract
+        shell: bash
 
       - name: Setup Go
         uses: actions/setup-go@v4
         with:
           go-version: '1.22'
 
-      - name: Install Go tools (httpx, nuclei, amass) - optional
+      - name: Cache Go build & modules + nuclei templates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ${{ github.workspace }}/go/pkg/mod
+            ~/.nuclei-templates
+          key: ${{ runner.os }}-go-mod-${{ hashFiles('**/go.sum') }}-nuclei-templates-v1
+
+      - name: Install optional Go tools (httpx, nuclei, amass) - best-effort
         run: |
           echo "$HOME/go/bin" >> $GITHUB_PATH
+          # install best-effort; don't fail the workflow if install is slow/fails
+          set -x
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest || true
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
-          go install -v github.com/owasp-amass/amass/v4/...@latest || true
-          # update nuclei templates if installed
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
+          go install github.com/owasp-amass/amass/v4/...@latest || true
+          # update nuclei templates if nuclei exists
           if command -v nuclei >/dev/null 2>&1; then
             nuclei -update-templates -silent || true
           fi
+        shell: bash
 
-      - name: Make scripts executable
-        run: chmod +x scan.sh
+      - name: Find and validate scan script path
+        id: findscript
+        run: |
+          # Look for scan.sh in common locations; prefer repo root
+          SCRIPT=""
+          if [ -f "./scan.sh" ]; then
+            SCRIPT="./scan.sh"
+          else
+            # try a few depths (limit to 3)
+            SCRIPT=$(find . -maxdepth 3 -type f -name "scan.sh" -print -quit || true)
+          fi
 
-      - name: Run scan (requires manual confirm = True)
+          echo "Discovered scan script path: ${SCRIPT}"
+
+          if [ -z "${SCRIPT}" ]; then
+            echo "ERROR: scan.sh not found in repository (searched root + depth 3)."
+            echo "Possible fixes:"
+            echo "  - Commit scan.sh at the repo root (recommended), or"
+            echo "  - Update this workflow to point to the correct path."
+            echo "Repository listing above for debugging."
+            exit 1
+          fi
+
+          # export path to subsequent steps
+          echo "script_path=${SCRIPT}" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Make discovered script executable
+        run: |
+          SCRIPT="${{ steps.findscript.outputs.script_path }}"
+          echo "[*] Making $SCRIPT executable"
+          chmod +x "$SCRIPT"
+          ls -la "$(dirname "$SCRIPT")"
+        shell: bash
+
+      - name: Run scan (uses discovered script)
         env:
-          # pass the manual input to the script
-          SCAN_CONFIRM: ${{ github.event.inputs.confirm }}
+          # concurrency & tuning defaults (tune via workflow_dispatch env overrides)
           GLOBAL_CONCURRENCY: "6"
           PER_TARGET_CONCURRENCY: "6"
           HTTPX_THREADS: "40"
           NUCLEI_RATE_LIMIT: "80"
           NUCLEI_THREADS: "40"
+          SCAN_CONFIRM: "True"   # script-level safety: confirm already checked above
         run: |
-          echo "[*] confirm value: $SCAN_CONFIRM"
-          ./scan.sh
+          set -euo pipefail
+          SCRIPT="${{ steps.findscript.outputs.script_path }}"
+          echo "[*] Executing scan script: $SCRIPT"
+          # Show a bit of context to help debug if the script fails
+          echo "---- head of $SCRIPT (first 120 lines) ----"
+          sed -n '1,120p' "$SCRIPT" || true
+          echo "---- running $SCRIPT ----"
+          bash -x "$SCRIPT"
+        shell: bash
 
       - name: Upload findings (optional)
         if: always()
