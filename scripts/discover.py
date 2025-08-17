@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import sys, requests, argparse, re
+import argparse, requests, json, re
+from urllib.parse import urlparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('domain')
@@ -10,33 +11,27 @@ domain = args.domain
 out = args.out
 subs = set()
 
-# seed with base domain and common prefixes
-subs.add(domain)
-for p in ['www','staging','dev','internal','canary','beta','api','admin']:
+# seed well-known prefixes
+for p in ['www','api','staging','dev','internal','canary','beta','admin','preview']:
     subs.add(f"{p}.{domain}")
+subs.add(domain)
 
-# query crt.sh
+# crt.sh fast query (public)
 try:
-    url = f'https://crt.sh/?q=%25.{domain}&output=json'
-    r = requests.get(url, timeout=15)
+    r = requests.get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=12)
     if r.status_code == 200:
-        try:
-            data = r.json()
-            for entry in data:
-                name = entry.get('name_value') or ''
-                for n in name.split('\n'):
-                    n = n.strip()
-                    if n:
-                        # filter wildcards
-                        n = n.replace('*.', '')
-                        subs.add(n)
-        except Exception:
-            pass
+        data = r.json()
+        for e in data:
+            nv = e.get('name_value','')
+            for line in nv.splitlines():
+                line = line.strip().replace('*.','')
+                if line:
+                    subs.add(line)
 except Exception:
     pass
 
-# write out
+# write unique
 with open(out, 'w') as f:
     for s in sorted(subs):
-        f.write(s + '\n')
-print(f'[+] wrote {out} ({len(subs)} entries)')
+        f.write(s + "\\n")
+print(f"[+] discovery -> {out} ({len(subs)} entries)")
