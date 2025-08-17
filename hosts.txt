@@ -18,8 +18,9 @@ metamask.io
 flipkart.com
 yelp.com
 
-# common derivations (the scanner will expand these heuristics)
-# {{target}}.staging
-# staging.{{target}}
-# dev.{{target}}
-# internal.{{target}}
+# staging patterns - scanner will expand these heuristics
+staging.%s
+dev.%s
+internal.%s
+canary.%s
+beta.%s
