@@ -7,12 +7,17 @@ on:
         description: "Type True (case-sensitive) to confirm you have written authorization to scan targets in hosts.txt"
         required: true
         default: "False"
+      top_n:
+        description: "Top hosts to aggressively scan (unused by this workflow; kept for compatibility)"
+        required: false
+        default: "150"
 
 permissions:
   contents: read
 
 env:
   GOBIN: /home/runner/.local/bin
+  TMP_NUCLEI: /tmp/nuclei-templates
 
 jobs:
   scan:
@@ -28,12 +33,12 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends jq dnsutils unzip git build-essential ca-certificates curl
           python3 -m pip install --upgrade pip
-          pip3 install --user aiohttp tldextract
+          pip3 install --user aiohttp tldextract python-dateutil dnspython requests
 
-      - name: Setup Go (stable)
+      - name: Setup Go (pin 1.24.x)
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22.x"
+          go-version: '1.24.6'
 
       - name: Go cache
         uses: actions/cache@v4
@@ -42,7 +47,7 @@ jobs:
             ~/.cache/go-build
             ~/go/pkg/mod
             ${{ env.GOBIN }}
-          key: go-${{ runner.os }}-${{ hashFiles('**/go.sum') || 'none' }}
+          key: go-${{ runner.os }}-${{ hashFiles('**/go.sum') || 'nohash' }}
 
       - name: Install Go tools (robust, absolute GOBIN)
         run: |
@@ -55,47 +60,56 @@ jobs:
           go env -w GOPROXY="https://proxy.golang.org,https://goproxy.io,direct" || true
 
           go_install_retry() {
-            pkg="$1"; tries=5; wait=3
+            pkg="$1"; tries=6; wait=3
             for i in $(seq 1 $tries); do
-              echo "::group::go install attempt $i -> $pkg"
+              echo "install attempt $i -> $pkg"
               if GOBIN="${GOBIN}" go install -v "$pkg"; then
                 echo "ok: $pkg"
-                echo "::endgroup::"
                 return 0
               fi
-              echo "retrying in ${wait}s"
-              echo "::endgroup::"
+              echo "failed attempt $i -> $pkg; retrying in ${wait}s"
               sleep "$wait"
               wait=$((wait*2))
             done
-            echo "::error::failed to install $pkg"
+            echo "::error::failed to install $pkg after $tries attempts"
             return 1
           }
 
+          # Critical tools for pipeline
           go_install_retry github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go_install_retry github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go_install_retry github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          go_install_retry github.com/owasp-amass/amass/v4/...@latest
+          go_install_retry github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
+          go_install_retry github.com/owasp-amass/amass/v4/...@latest || true
+          go_install_retry github.com/ffuf/ffuf@latest || true
 
-          # Smoke checks (hard fail if missing)
+          # smoke checks (hard fail for core discover/probe tools)
           command -v subfinder >/dev/null || (echo "::error::subfinder not found" && exit 1)
-          command -v dnsx >/dev/null || (echo "::error::dnsx not found" && exit 1)
-          command -v httpx >/dev/null || (echo "::error::httpx not found" && exit 1)
-          command -v nuclei >/dev/null || (echo "::error::nuclei not found" && exit 1)
-          command -v amass >/dev/null || (echo "::error::amass not found" && exit 1)
+          command -v dnsx >/dev/null    || (echo "::error::dnsx not found" && exit 1)
+          command -v httpx >/dev/null   || (echo "::error::httpx not found" && exit 1)
+          command -v nuclei >/dev/null  || echo "::warning::nuclei not found (templates/scan will be skipped)"
+          command -v amass >/dev/null   || echo "::warning::amass not found (amass passive will be skipped)"
+          command -v ffuf >/dev/null    || echo "::warning::ffuf not found (dir fuzz will be skipped)"
 
-          nuclei -update-templates -silent || true
+          # fetch nuclei templates if installed
+          if command -v nuclei >/dev/null; then
+            rm -rf "${TMP_NUCLEI}"
+            git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates "${TMP_NUCLEI}" || \
+              (curl -fsSL https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/master.zip -o /tmp/nuclei-templates.zip && unzip -q /tmp/nuclei-templates.zip -d /tmp && mv /tmp/nuclei-templates-master "${TMP_NUCLEI}" 2>/dev/null || true)
+            [ -d "${TMP_NUCLEI}" ] && nuclei -update-templates -silent || true
+          fi
 
-      - name: Make scripts executable
-        run: chmod +x scan.sh
+      - name: Make runner scripts executable
+        run: |
+          set -euxo pipefail
+          chmod +x scan.sh smart_hunt.py
 
       - name: Run scan (manual confirm=True required)
         env:
           SCAN_CONFIRM: ${{ github.event.inputs.confirm }}
-          # Global knobs — tuned for ≤6h typical bounty inputs (adjust on dispatch if needed)
-          GLOBAL_CONCURRENCY: "10"          # across roots
-          PER_TARGET_CONCURRENCY: "14"      # inside smart checks
+          # Tunables (safe defaults for <=6h)
+          GLOBAL_CONCURRENCY: "10"
+          PER_TARGET_CONCURRENCY: "14"
           AMASS_TIMEOUT_MIN: "10"
           SUBFINDER_SOURCES: "all"
           DNSX_WORKERS: "220"
@@ -103,11 +117,12 @@ jobs:
           HTTPX_TIMEOUT: "8"
           NUCLEI_THREADS: "120"
           NUCLEI_RATE_LIMIT: "200"
-          MAX_URLS_PER_HOST: "1200"         # per host cap (true per-host sampling)
+          NUCLEI_SEVERITY: "medium,high,critical"
+          MAX_URLS_PER_HOST: "1200"
           PATH_CHECK_TOP_HOSTS: "200"
         run: ./scan.sh
 
-      - name: Upload findings
+      - name: Upload findings and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
