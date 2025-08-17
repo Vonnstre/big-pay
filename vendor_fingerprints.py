@@ -10,7 +10,7 @@ VENDORS = {
     },
     "github_pages": {
         "cname_contains": [".github.io"],
-        "body_contains": ["There isn’t a GitHub Pages site here.", "Repository not found"]
+        "body_contains": ["There isn’t a GitHub Pages site here", "Repository not found"]
     },
     "heroku": {
         "cname_contains": [".herokudns.com", ".herokuapp.com"],
