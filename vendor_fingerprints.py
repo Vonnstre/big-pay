@@ -1,4 +1,5 @@
-# Minimal vendor fingerprints for takeover/error banners
+# Minimal vendor fingerprints for takeover/error banners (expandable)
+
 VENDORS = {
     "aws_s3": {
         "cname_contains": [".s3.amazonaws.com", ".s3-website"],
@@ -17,7 +18,7 @@ VENDORS = {
         "body_contains": ["no such app", "heroku | error"]
     },
     "vercel": {
-        "cname_contains": [".vercel-dns.com", ".zeit.world"],
+        "cname_contains": [".vercel-dns.com", ".zeit.world", ".vercel.app"],
         "body_contains": ["DEPLOYMENT_NOT_FOUND", "The deployment must be ready", "Vercel 404"]
     },
     "netlify": {
