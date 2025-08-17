@@ -1,9 +1,0 @@
-{
-  "auto_draft_threshold": 50,
-  "manual_lower": 35,
-  "exploitability": { "cors_creds": 9, "redirect_auth": 8, "takeover": 7, "admin": 7, "ssrf_evidence": 6, "public_bucket": 6, "git_leak": 6 },
-  "impact": { "auth_data_read": 9, "phishing_enabled": 7, "structural_leak": 5, "noisy_header": 2 },
-  "noise_penalty_default": 2,
-  "auth_weight": 1.6,
-  "max_body_store_kb": 64
-}
