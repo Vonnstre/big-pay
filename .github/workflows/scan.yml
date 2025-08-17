@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type exactly **true** to confirm you have written authorization to scan these targets'
+        description: 'Type exactly True to confirm you have written authorization to scan these targets'
         required: true
         default: 'False'
 
@@ -16,40 +16,78 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Validate manual confirmation
         run: |
-          echo "[*] confirm input: '${{ github.event.inputs.confirm }}'"
+          echo "confirm input: '${{ github.event.inputs.confirm }}'"
           if [ "${{ github.event.inputs.confirm }}" != "True" ]; then
-            echo " ERROR: must type exactly 'True' (case-sensitive) to proceed."
+            echo "ERROR: You must type the exact string 'True' (case-sensitive) to proceed."
             exit 1
           fi
 
-      - name: Show repo root and contents (debug)
+      - name: Show repo (debug)
         run: |
-          pwd
-          ls -R .
+          echo "PWD: $(pwd)"
+          echo "TOP-LEVEL:"
+          ls -la
+          echo "RECURSIVE (depth 3):"
+          find . -maxdepth 3 -type f -print | sed -n '1,200p'
 
-      - name: Validate presence of essential files
+      - name: Discover scan.sh (root -> scripts -> find)
+        id: discover
         run: |
+          SCRIPT=""
+          if [ -f "./scan.sh" ]; then
+            SCRIPT="./scan.sh"
+          elif [ -f "./scripts/scan.sh" ]; then
+            SCRIPT="./scripts/scan.sh"
+          else
+            SCRIPT=$(find . -maxdepth 4 -type f -name "scan.sh" -print -quit || true)
+          fi
+          if [ -z "$SCRIPT" ]; then
+            echo "ERROR: scan.sh not found (searched root, ./scripts/, depth 4)."
+            exit 1
+          fi
+          echo "Found scan script at: $SCRIPT"
+          echo "script_path=$SCRIPT" >> "$GITHUB_OUTPUT"
+          echo "script_dir=$(dirname "$SCRIPT")" >> "$GITHUB_OUTPUT"
+
+      - name: Validate required companion files
+        run: |
+          SCRIPT_DIR="${{ steps.discover.outputs.script_dir }}"
+          # hosts.txt must exist at repo root (we will copy if running from subdir)
+          if [ ! -f "$GITHUB_WORKSPACE/hosts.txt" ]; then
+            echo "ERROR: hosts.txt not found in repo root ($GITHUB_WORKSPACE/hosts.txt)."
+            exit 1
+          fi
+
+          # Check smart_hunt.py & vendor_fingerprints.py either next to scan.sh or in repo root
           missing=0
-          for f in scan.sh smart_hunt.py vendor_fingerprints.py hosts.txt; do
-            if [ ! -f "$f" ]; then
-              echo " ERROR: Required file '$f' not found in repo root."
+          for f in smart_hunt.py vendor_fingerprints.py; do
+            if [ -f "$SCRIPT_DIR/$f" ]; then
+              echo "OK: $f found in $SCRIPT_DIR"
+            elif [ -f "$GITHUB_WORKSPACE/$f" ]; then
+              echo "OK: $f found in repo root"
+            else
+              echo "ERROR: Required $f not found in $SCRIPT_DIR or repo root"
               missing=1
             fi
           done
           if [ "$missing" -eq 1 ]; then
-            echo " Aborting due to missing files."
+            echo "Aborting due to missing companion files."
             exit 1
           fi
 
-      - name: Make scan.sh executable
-        run: chmod +x scan.sh
+      - name: Make discovered script executable
+        run: |
+          SCRIPT_PATH="${{ steps.discover.outputs.script_path }}"
+          echo "chmod +x $SCRIPT_PATH"
+          chmod +x "$SCRIPT_PATH"
+          ls -la "$(dirname "$SCRIPT_PATH")"
 
-      - name: Install system dependencies
+      - name: Install system deps
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq dnsutils unzip git build-essential
@@ -57,21 +95,12 @@ jobs:
           pip3 install aiohttp tldextract
         shell: bash
 
-      - name: Setup Go
+      - name: Setup Go (optional)
         uses: actions/setup-go@v4
         with:
           go-version: '1.22'
 
-      - name: Cache Go and nuclei templates
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ${{ github.workspace }}/go/pkg/mod
-            ~/.nuclei-templates
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-
-      - name: Install optional Go tools
+      - name: Install optional Go tools (best-effort)
         run: |
           echo "$HOME/go/bin" >> $GITHUB_PATH
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest || true
@@ -82,7 +111,18 @@ jobs:
           fi
         shell: bash
 
-      - name: Run the scan
+      - name: Prepare execution dir (copy hosts.txt if script is in subdir)
+        run: |
+          SCRIPT_DIR="${{ steps.discover.outputs.script_dir }}"
+          # If script dir is not repo root, copy hosts.txt into it so relative references work
+          if [ "$SCRIPT_DIR" != "." ] && [ "$SCRIPT_DIR" != "/" ]; then
+            echo "Copying hosts.txt to $SCRIPT_DIR/hosts.txt"
+            cp "$GITHUB_WORKSPACE/hosts.txt" "$GITHUB_WORKSPACE/$SCRIPT_DIR/hosts.txt"
+          fi
+          echo "Working dir for scan: $SCRIPT_DIR"
+        shell: bash
+
+      - name: Run the scan from script directory
         env:
           SCAN_CONFIRM: "True"
           GLOBAL_CONCURRENCY: "6"
@@ -91,12 +131,19 @@ jobs:
           NUCLEI_RATE_LIMIT: "80"
           NUCLEI_THREADS: "40"
         run: |
-          set -euxo pipefail
-          echo "[*] Running scan.sh script"
-          ./scan.sh
+          SCRIPT_PATH="${{ steps.discover.outputs.script_path }}"
+          SCRIPT_DIR="${{ steps.discover.outputs.script_dir }}"
+          echo "About to run: $SCRIPT_PATH (working dir: $SCRIPT_DIR)"
+          # Ensure absolute path and strip leading './' for pushd
+          cd "$GITHUB_WORKSPACE/$SCRIPT_DIR"
+          echo "PWD now: $(pwd)"
+          echo "---- head of script (first 80 lines) ----"
+          sed -n '1,80p' "$(basename "$SCRIPT_PATH")" || true
+          echo "---- executing script ----"
+          bash -x "$(basename "$SCRIPT_PATH")"
         shell: bash
 
-      - name: Upload findings
+      - name: Upload findings (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
