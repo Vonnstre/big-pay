@@ -1,0 +1,57 @@
+name: Full CORS & GraphQL Audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - hosts.txt
+      - scripts/**
+      - .github/workflows/full-cors-workflow.yml
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: python -m pip install --upgrade pip && pip install requests
+
+      - name: Run recon probe
+        env:
+          ATTACKER_ORIGIN: ${{ secrets.ATTACKER_ORIGIN }}  # optional override
+          TEST_COOKIE: ${{ secrets.TEST_COOKIE }}          # optional
+        run: |
+          python scripts/recon_probe.py
+
+      - name: Finalize audit decisions
+        run: |
+          python scripts/audit_finalize.py
+
+      - name: Generate PoCs for HIGH
+        run: |
+          python scripts/generate_pocs.py
+
+      - name: Prepare archive
+        run: |
+          ls -lah out || true
+          ls -lah pocs || true
+          zip -r out/artifacts.zip out pocs || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cors-audit-artifacts
+          path: |
+            out/findings.json
+            out/findings.csv
+            out/decision.csv
+            out/artifacts.zip
+            pocs/
+            out/raw/
