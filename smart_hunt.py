@@ -2,39 +2,30 @@
 """
 smart_hunt.py — greedy Low/Med harvester
 
-Inputs:
-  - httpx JSON (jsonl) + alive sample list
-  - optional nuclei jsonl (fold mode)
+Inputs: httpx JSON + alive sample list
 
-Targets:
-  - CORS w/ credentials + reflected origin
-  - Auth redirects (open redirect on auth flows)
-  - Admin panels w/o auth wall
-  - Dir listing
-  - Exposed .git / .env
-  - Backup artifacts
-  - Subdomain takeover banners (lightweight)
-  - GraphQL introspection enabled
-
-Output:
-  - Per-finding evidence folder zipped + summary lines
+Output: per-finding evidence zip + summary
 """
 
-import argparse, asyncio, aiohttp, os, json, hashlib, re, time, zipfile
+import argparse
+import asyncio
+import aiohttp
+import os
+import json
+import hashlib
+import re
+import time
+import zipfile
 from collections import defaultdict, Counter
 from urllib.parse import urlparse, urlencode, urlunparse, parse_qsl
 from vendor_fingerprints import VENDORS
 
-# ---------- helpers ----------
-
+# helpers / markers
 REDACTION_PATTERNS = [
-    re.compile(r'(?:api|secret|token|key|pwd|pass|bearer|authorization)[=:]\s*([A-Za-z0-9._-]{8,})', re.I),
+    re.compile(r'(?i)(?:api|secret|token|key|pwd|pass|bearer|authorization)[=:]\s*([A-Za-z0-9._-]{8,})'),
 ]
 AUTH_HINT = re.compile(r'(login|sign[\s_-]*in|reset\s*password|2fa|mfa|oauth|authorize)', re.I)
-ADMIN_MARKERS = re.compile(
-    r'(grafana|kibana|jenkins|sonarqube|nexus\s+repository|pgadmin|prometheus|kubernetes\s+dashboard|'
-    r'rabbitmq|airflow|superset|laravel\s+horizon|minio\s+console|gitlab|portainer)', re.I)
-
+ADMIN_MARKERS = re.compile(r'(grafana|kibana|jenkins|sonarqube|nexus\s+repository|pgadmin|prometheus|kubernetes\s+dashboard|rabbitmq|airflow|superset|laravel\s+horizon|minio|gitlab|portainer)', re.I)
 DIRLIST_MARKERS = re.compile(r'Index of /|<title>Index of', re.I)
 GIT_HEAD_MARKER = re.compile(r'^ref:\s+refs/heads/', re.I | re.M)
 ENV_MARKERS = re.compile(r'(APP_KEY|DB_PASSWORD|DB_HOST|SECRET|AWS_|REDIS_|TOKEN=)', re.I)
@@ -80,21 +71,18 @@ def base_of(u):
     pu = urlparse(u)
     return f"{pu.scheme}://{pu.hostname}" + (f":{pu.port}" if pu.port else "")
 
-# ---------- HTTP ----------
+# HTTP helpers
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=10, sock_read=15, sock_connect=10)
 
 async def fetch(session, method, url, headers=None, allow_redirects=False):
     try:
         async with session.request(method, url, headers=headers or {}, allow_redirects=allow_redirects) as r:
             b = await r.read()
-            return dict(ok=True, status=r.status, url=str(r.url),
-                        headers={k.lower(): v for k, v in r.headers.items()},
-                        body=b)
+            return dict(ok=True, status=r.status, url=str(r.url), headers={k.lower(): v for k,v in r.headers.items()}, body=b)
     except Exception as e:
         return dict(ok=False, status=0, error=str(e), url=url, headers={}, body=b"")
 
-# ---------- checks (easy L/M) ----------
-
+# checks
 async def check_dirlisting(session, url):
     r = await fetch(session, "GET", url)
     if r["ok"] and r["status"] == 200 and DIRLIST_MARKERS.search(r["body"].decode(errors="ignore")):
@@ -159,10 +147,7 @@ async def check_admin_panel(session, url):
     return None
 
 async def check_backup_files(session, url_base):
-    candidates = [
-        "/backup.zip","/db.sql","/database.sql","/backup.sql","/dump.sql",
-        "/config.php.bak","/config.php~","/wp-config.php.bak","/env.bak",
-    ]
+    candidates = ["/backup.zip","/db.sql","/database.sql","/backup.sql","/dump.sql","/config.php.bak","/config.php~","/wp-config.php.bak","/env.bak"]
     tasks = [fetch(session,"GET", url_base+p) for p in candidates]
     rs = await asyncio.gather(*tasks, return_exceptions=False)
     for r,p in zip(rs,candidates):
@@ -170,7 +155,7 @@ async def check_backup_files(session, url_base):
             return dict(kind="backup", resp=r, url=url_base+p)
     return None
 
-def takeover_from_text(body: str, headers: dict, cnames: list[str] | None = None):
+def takeover_from_text(body: str, headers: dict, cnames=None):
     blob = (body or "").lower() + "\n" + json.dumps(headers or {}).lower()
     for vendor, fp in VENDORS.items():
         for sig in fp.get("body_contains", []):
@@ -181,8 +166,9 @@ def takeover_from_text(body: str, headers: dict, cnames: list[str] | None = None
                 return vendor
         if cnames:
             for c in cnames:
-                if any(s in c.lower() for s in fp.get("cname_contains", [])):
-                    return vendor
+                for s in fp.get("cname_contains", []):
+                    if s.lower() in str(c).lower():
+                        return vendor
     return None
 
 async def check_takeover(session, host, scheme="https"):
@@ -201,17 +187,14 @@ async def check_graphql(session, base_url):
     # try GET and POST variants
     get_url = with_query(base_url + "/graphql", {"query": "{__schema{types{name}}}"})
     r1 = await fetch(session, "GET", get_url)
-    r2 = await fetch(session, "POST", base_url + "/graphql",
-                     headers={"content-type": "application/json"},
-                     allow_redirects=False)
+    r2 = await fetch(session, "POST", base_url + "/graphql", headers={"content-type": "application/json"}, allow_redirects=False)
     body1 = r1["body"].decode(errors="ignore") if r1["ok"] else ""
     body2 = r2["body"].decode(errors="ignore") if r2["ok"] else ""
     if ("__schema" in body1) or ("__schema" in body2):
         return dict(kind="graphql", resp=(r1 if "__schema" in body1 else r2), url=base_url + "/graphql")
     return None
 
-# ---------- evidence ----------
-
+# evidence writing
 def write_evidence(base_dir, finding, target):
     ensure_dir(base_dir)
     now = int(time.time())
@@ -235,7 +218,6 @@ def write_evidence(base_dir, finding, target):
         h, head, tail, clipped = redacted_snippet(resp.get("body", b""))
         with open(os.path.join(fdir,f"{prefix}_summary.txt"),"w",encoding="utf-8",errors="ignore") as fh:
             fh.write(f"URL: {resp.get('url')}\nStatus: {resp.get('status')}\n\nHeaders:\n{hdrs}\n\nBodySHA256: {h}\nClipped: {clipped}\n")
-        # keep tiny snippets for quick eyeballing
         with open(os.path.join(fdir,f"{prefix}_head.bin"),"wb") as fh: fh.write(head)
         if tail:
             with open(os.path.join(fdir,f"{prefix}_tail.bin"),"wb") as fh: fh.write(tail)
@@ -243,7 +225,7 @@ def write_evidence(base_dir, finding, target):
     for k in ("base","test","resp"):
         if k in finding: dump_resp(k, finding[k])
 
-    # PoCs
+    # simple PoCs
     if ftype == "cors":
         poc = f"""<!doctype html><meta charset="utf-8"><h1>CORS (with credentials) PoC</h1>
 <script>(async()=>{{try{{const r=await fetch("{finding.get('url')}",{{credentials:"include",mode:"cors",headers:{{Origin:"{finding.get('origin')}"}}}});document.body.innerText=(await r.text()).slice(0,400)}}catch(e){{console.log(e)}}}})();</script>"""
@@ -261,12 +243,9 @@ def write_evidence(base_dir, finding, target):
             z.write(os.path.join(fdir,fn), arcname=fn)
     return fid
 
-# ---------- orchestrator ----------
-
 async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path_check_top_hosts):
     ensure_dir(outdir)
 
-    # Parse httpx JSON lines
     urls, titles, by_host = [], {}, defaultdict(list)
     techs = defaultdict(set)
     schemes = defaultdict(lambda: "https")
@@ -284,10 +263,8 @@ async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path
                 u = u.rstrip("/")
                 urls.append(u); titles[u] = t
                 schemes[h] = j.get("scheme","https")
-                # httpx sets "tech" when -tech-detect
                 for tech in (j.get("tech","") or "").split(","):
                     if tech.strip(): techs[h].add(tech.strip().lower())
-                # cnames (can be list or string depending on build)
                 cval = j.get("cname")
                 if isinstance(cval, list):
                     cnames[h].extend([str(x) for x in cval])
@@ -299,7 +276,7 @@ async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path
     if alive_file and os.path.isfile(alive_file):
         alive = [l.strip() for l in open(alive_file,"r",encoding="utf-8",errors="ignore") if l.strip()]
 
-    # Rank hosts by interestingness
+    # Rank hosts
     host_scores = Counter()
     for h, lst in by_host.items():
         t_hits = sum(1 for u in lst if AUTH_HINT.search(titles.get(u,"")))
@@ -315,10 +292,9 @@ async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path
     async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT, connector=conn) as session:
 
         async def bounded(fn, *a, **kw):
-            async with sem:
-                return await fn(*a, **kw)
+            async with sem: return await fn(*a, **kw)
 
-        # 1) Per-URL checks (CORS, redirects, admin)
+        # per-URL checks
         cors_tasks  = [bounded(check_cors, session, u) for u in alive]
         redir_tasks = [bounded(check_redirects, session, u) for u in alive]
         admin_candidates = [u for u in alive if ("admin" in u or "dashboard" in u or AUTH_HINT.search(titles.get(u,"")))]
@@ -344,7 +320,7 @@ async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path
                 s = score("admin", signal=0.9)
                 findings.append(dict(kind="admin", url=u, resp=r["resp"], score=s))
 
-        # 2) Per-host path checks (.env, .git, backup files, dir listing, graphql)
+        # per-host path checks
         dir_tasks = [bounded(check_dirlisting, session, b + "/") for b in base_urls]
         git_tasks = [bounded(check_git_exposed, session, b) for b in base_urls]
         env_tasks = [bounded(check_env_exposed, session, b) for b in base_urls]
@@ -353,36 +329,31 @@ async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path
 
         dir_res, git_res, env_res, bak_res, gql_res = await asyncio.gather(
             asyncio.gather(*dir_tasks), asyncio.gather(*git_tasks),
-            asyncio.gather(*env_tasks), asyncio.gather(*bak_tasks),
-            asyncio.gather(*gql_tasks)
+            asyncio.gather(*env_tasks), asyncio.gather(*bak_tasks), asyncio.gather(*gql_tasks)
         )
 
         for b, r in zip(base_urls, dir_res):
             if r:
                 s = score("dirlist", signal=0.8)
                 findings.append(dict(kind="dirlist", url=b + "/", resp=r["resp"], score=s, notes="Auto index enabled"))
-
         for b, r in zip(base_urls, git_res):
             if r:
                 s = score("git", signal=0.9)
                 findings.append(dict(kind="git", url=r["url"], resp=r["resp"], score=s, notes="Exposed .git/HEAD"))
-
         for b, r in zip(base_urls, env_res):
             if r:
                 s = score("env", signal=1.0)
                 findings.append(dict(kind="env", url=r["url"], resp=r["resp"], score=s, notes="Exposed .env (secrets likely)"))
-
         for b, r in zip(base_urls, bak_res):
             if r:
                 s = score("backup", signal=0.95)
                 findings.append(dict(kind="backup", url=r["url"], resp=r["resp"], score=s, notes="Backup artifact accessible"))
-
         for b, r in zip(base_urls, gql_res):
             if r:
                 s = score("graphql", signal=0.75)
                 findings.append(dict(kind="graphql", url=r["url"], resp=r["resp"], score=s, notes="GraphQL introspection enabled"))
 
-        # 3) Subdomain takeover (by host)
+        # takeover checks (per-host)
         hosts = list({h for h in by_host.keys()})
         tk_tasks = [bounded(check_takeover, session, h, schemes.get(h,"https")) for h in hosts]
         tk_res = await asyncio.gather(*tk_tasks)
@@ -398,7 +369,8 @@ async def gather_checks(target, httpx_json, alive_file, outdir, per_target, path
             fid = write_evidence(outdir, f, target)
             line = f"[{target}] {f['kind']} -> score {f['score']} :: {fid}"
             S.write(line + "\n")
-            if f["score"] >= AUTO_DRAFT_THRESHOLD: auto += 1
+            if f["score"] >= AUTO_DRAFT_THRESHOLD:
+                auto += 1
         S.write(f"Auto-drafts (>= {AUTO_DRAFT_THRESHOLD}): {auto}\n")
 
 def fold_nuclei(target, nuclei_json, outdir):
@@ -407,8 +379,10 @@ def fold_nuclei(target, nuclei_json, outdir):
     count = 0
     with open(nuclei_json,"r",encoding="utf-8",errors="ignore") as fh:
         for line in fh:
-            try: j = json.loads(line)
-            except Exception: continue
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
             url = j.get("matched-at") or j.get("host") or j.get("url")
             if not url: continue
             s = score("nuclei", signal=0.7)
