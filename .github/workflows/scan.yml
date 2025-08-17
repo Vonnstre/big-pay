@@ -13,42 +13,13 @@ permissions:
 
 jobs:
   scan:
-    if: ${{ github.event.inputs.confirm == 'True' }}
     runs-on: ubuntu-latest
     timeout-minutes: 420
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate manual confirmation
-        run: echo "Confirmed = ${{ github.event.inputs.confirm }}"
-
-      - name: Show repo root and contents (debug)
-        run: |
-          pwd
-          ls -la
-          echo "---- scripts/ ----"
-          ls -la scripts || true
-
-      - name: Validate presence of essential files
-        run: |
-          missing=0
-          for f in scripts/scan.sh scripts/smart_hunt.py scripts/vendor_fingerprints.py hosts.txt; do
-            if [ ! -f "$f" ]; then
-              echo "ERROR: Required file '$f' not found."
-              missing=1
-            fi
-          done
-          if [ $missing -ne 0 ]; then
-            echo "Aborting due to missing files."
-            exit 1
-          fi
-
-      - name: Make scan.sh executable
-        run: chmod +x scripts/scan.sh
-
-      - name: Install system dependencies
+      - name: Install system deps
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq dnsutils unzip git build-essential
@@ -56,43 +27,41 @@ jobs:
           pip3 install aiohttp tldextract
 
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: "1.22"
 
-      - name: Cache Go and nuclei templates
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-            ~/.local/nuclei-templates
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-nuclei
-
-      - name: Install optional Go tools (subfinder, amass, httpx, nuclei)
+      - name: Install Go tools
         run: |
           echo "$HOME/go/bin" >> $GITHUB_PATH
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
-          go install -v github.com/owasp-amass/amass/v4/...@latest || true
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest || true
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
-          if command -v nuclei >/dev/null 2>&1; then
-            nuclei -update-templates -silent || true
-          fi
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install -v github.com/owasp-amass/amass/v4/...@latest
+          nuclei -update-templates -silent || true
 
-      - name: Run the scan (uses discovered script)
+      - name: Make scripts executable
+        run: chmod +x scan.sh
+
+      - name: Run scan (requires manual confirm=True)
         env:
           SCAN_CONFIRM: ${{ github.event.inputs.confirm }}
-          GLOBAL_CONCURRENCY: "8"          # parallel roots
-          PER_TARGET_CONCURRENCY: "8"      # async checks per root
-          HTTPX_THREADS: "200"
-          HTTPX_TIMEOUT: "10"
+          GLOBAL_CONCURRENCY: "10"         # across roots
+          PER_TARGET_CONCURRENCY: "12"     # inside smart checks
+          AMASS_TIMEOUT_MIN: "10"
+          SUBFINDER_SOURCES: "all"
+          DNSX_WORKERS: "200"
+          HTTPX_THREADS: "150"
+          HTTPX_TIMEOUT: "8"
           NUCLEI_THREADS: "120"
-          NUCLEI_RATE_LIMIT: "140"
-          AMASS_TIMEOUT_MIN: "8"
-        run: scripts/scan.sh
+          NUCLEI_RATE_LIMIT: "200"
+          # smart filter knobs
+          MAX_URLS_PER_HOST: "2000"
+          PATH_CHECK_TOP_HOSTS: "200"      # most interesting hosts by httpx signals
+        run: ./scan.sh
 
-      - name: Upload findings (always)
+      - name: Upload findings
         if: always()
         uses: actions/upload-artifact@v4
         with:
